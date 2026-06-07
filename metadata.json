@@ -1,0 +1,6 @@
+{
+  "name": "班牌悬浮助手",
+  "description": "提供悬浮窗控制、快捷强行停止应用以及一键返回主菜单的系统辅助管理工具，适用于安卓9电子班牌等设备。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
