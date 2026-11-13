@@ -309,15 +309,15 @@ class FloatingWindowService : Service() {
         return container
     }
 
-    private fun actionButton(label: String, background: String, foreground: String, onClick: () -> Unit): Button {
+    private fun actionButton(label: String, bgColor: String, foreground: String, onClick: () -> Unit): Button {
         return Button(this).apply {
             text = label
             textSize = 12f
             isAllCaps = false
             setTextColor(Color.parseColor(foreground))
-            background = GradientDrawable().apply {
+            this.background = GradientDrawable().apply {
                 cornerRadius = dp(10).toFloat()
-                setColor(Color.parseColor(background))
+                setColor(Color.parseColor(bgColor))
             }
             val layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,

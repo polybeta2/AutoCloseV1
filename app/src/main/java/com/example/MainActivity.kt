@@ -423,7 +423,7 @@ private fun HomeScreen(
 
                 ToggleRow(
                     label = "开机压制",
-                    detail = if (bootGuard) "开机后 " + InterceptConfig.describeSeconds(bootSeconds) + " 内班牌一冒头就顶回去" else "不做开机压制",
+                    detail = if (bootGuard) "开机后 " + InterceptConfig.describeSeconds(bootSeconds.toLong()) + " 内班牌一冒头就顶回去" else "不做开机压制",
                     checked = bootGuard
                 ) { value ->
                     bootGuard = value
@@ -432,7 +432,7 @@ private fun HomeScreen(
 
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    text = "压制时长：" + InterceptConfig.describeSeconds(bootSeconds),
+                    text = "压制时长：" + InterceptConfig.describeSeconds(bootSeconds.toLong()),
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
