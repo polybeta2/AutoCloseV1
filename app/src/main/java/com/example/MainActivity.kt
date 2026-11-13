@@ -1,30 +1,56 @@
 package com.example
 
+import android.annotation.SuppressLint
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
-import android.content.SharedPreferences
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
-import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
-import androidx.compose.animation.AnimatedVisibility
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -32,39 +58,44 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
+import androidx.core.app.NotificationManagerCompat
 import com.example.ui.theme.MyApplicationTheme
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.delay
 
-data class AppItem(val name: String, val packageName: String)
-
+/**
+ * 班牌悬浮助手 · 控制台
+ *
+ * 三条能力线：
+ *  1) 开机自启（不依赖无障碍）：BOOT_COMPLETED 接收器 + 前台服务
+ *  2) 开机压制：开机后一段时间内班牌一冒头就顶回桌面，等效"拦截它开机自启"
+ *  3) 被关闭后拉起：AlarmManager 五分钟心跳 + 前台服务互相看护
+ */
 class MainActivity : ComponentActivity() {
 
-    private lateinit var sharedPrefs: SharedPreferences
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            Toast.makeText(
+                this,
+                if (granted) "通知权限已授权，服务可稳定常驻" else "未授权通知，前台服务可能被系统限制",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
-        sharedPrefs = getSharedPreferences("class_brand_prefs", Context.MODE_PRIVATE)
-
-        // Guide overlay permission on first startup automatically
         checkAndRequestFirstLaunchPermissions()
-
         setContent {
             MyApplicationTheme {
-                Scaffold(
-                    modifier = Modifier.fillMaxSize()
-                ) { innerPadding ->
-                    MainConfigScreen(
-                        modifier = Modifier.padding(innerPadding),
-                        onOpenOverlaySettings = { openOverlaySettings() },
-                        onOpenAccessibilitySettings = { openAccessibilitySettings() },
-                        onOpenAutoStartSettings = { openAutoStartSettings(this) }
+                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                    HomeScreen(
+                        onRequestOverlay = { openOverlaySettings() },
+                        onRequestUsage = { openUsageAccessSettings() },
+                        onRequestBattery = { requestIgnoreBatteryOptimizations() },
+                        onRequestNotification = { requestNotificationPermission() },
+                        onRequestAutoStart = { openAutoStartSettings(this) },
+                        onOpenDetails = { AppActions.openAppDetails(this, packageName) }
                     )
                 }
             }
@@ -73,179 +104,217 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Force redraw or sync states if needed when user returns from settings pages
+        // 回到前台时把预置能力补齐（Android 11+ 开机广播需要一次真实启动）
+        val prefs = InterceptConfig.prefs(this)
+        if (prefs.getBoolean(InterceptConfig.KEY_GUARD_ENABLED, true) && !GuardianService.isRunning) {
+            GuardianService.start(this)
+        }
+        WatchdogScheduler.ensureArmed(this)
     }
 
     private fun checkAndRequestFirstLaunchPermissions() {
-        // Overlay permission is critical for showing float window
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
-            Toast.makeText(this, "需要“在其他应用上显示”权限来开启悬浮窗", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "请允许「显示在其他应用上层」，悬浮控制台才能工作", Toast.LENGTH_LONG).show()
             openOverlaySettings()
         }
     }
 
+    // ---------------- 权限跳转 ----------------
+
     private fun openOverlaySettings() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        try {
+            val intent = Intent(
+                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:$packageName")
+            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+        } catch (t: Throwable) {
             try {
-                val intent = Intent(
-                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                    Uri.parse("package:$packageName")
-                )
-                startActivity(intent)
-            } catch (e: Exception) {
-                // Fallback
-                try {
-                    val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION)
-                    startActivity(intent)
-                } catch (err: Exception) {
-                    Toast.makeText(this, "无法打开悬浮窗设置，请手动开启", Toast.LENGTH_SHORT).show()
-                }
+                startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            } catch (ignored: Throwable) {
+                Toast.makeText(this, "无法打开悬浮窗设置，请手动在系统设置中授权", Toast.LENGTH_LONG).show()
             }
         }
     }
 
-    private fun openAccessibilitySettings() {
+    private fun openUsageAccessSettings() {
         try {
-            val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
-            startActivity(intent)
-            Toast.makeText(this, "请在列表中找到并开启「班牌悬浮助手」", Toast.LENGTH_LONG).show()
-        } catch (e: Exception) {
-            Toast.makeText(this, "无法打开无障碍设置，请在系统设置中手动开启", Toast.LENGTH_SHORT).show()
+            startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (t: Throwable) {
+            Toast.makeText(this, "无法打开「使用情况访问」设置", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    @SuppressLint("BatteryLife")
+    private fun requestIgnoreBatteryOptimizations() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        val power = getSystemService(Context.POWER_SERVICE) as? PowerManager
+        if (power != null && power.isIgnoringBatteryOptimizations(packageName)) {
+            Toast.makeText(this, "已在电池优化白名单中", Toast.LENGTH_SHORT).show()
+            return
+        }
+        try {
+            startActivity(
+                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        } catch (t: Throwable) {
+            try {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            } catch (ignored: Throwable) {
+                Toast.makeText(this, "无法打开电池优化设置", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            notificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            Toast.makeText(this, "当前系统无需申请通知权限", Toast.LENGTH_SHORT).show()
         }
     }
 
     private fun openAutoStartSettings(context: Context) {
-        val intentList = listOf(
-            Intent().setClassName("com.miui.securitycenter", "com.miui.permcenter.autostart.AutoStartManagementActivity"),
-            Intent().setClassName("com.huawei.systemmanager", "com.huawei.systemmanager.startupmgr.StartupNormalAppListActivity"),
-            Intent().setClassName("com.huawei.systemmanager", "com.huawei.systemmanager.optimize.process.ProtectActivity"),
-            Intent().setClassName("com.coloros.safecenter", "com.coloros.safecenter.startupapp.StartupAppListActivity"),
-            Intent().setClassName("com.coloros.safecenter", "com.coloros.safecenter.permission.startup.StartupAppListActivity"),
-            Intent().setClassName("com.vivo.permissionmanager", "com.vivo.permissionmanager.activity.BgStartUpManagerActivity"),
-            Intent().setClassName("com.samsung.android.lool", "com.samsung.android.sm.ui.battery.BatteryActivity")
+        val intents = listOf(
+            Intent().setComponent(
+                android.content.ComponentName(
+                    "com.miui.securitycenter",
+                    "com.miui.permcenter.autostart.AutoStartManagementActivity"
+                )
+            ),
+            Intent().setComponent(
+                android.content.ComponentName(
+                    "com.huawei.systemmanager",
+                    "com.huawei.systemmanager.startupmgr.StartupNormalAppListActivity"
+                )
+            ),
+            Intent().setComponent(
+                android.content.ComponentName(
+                    "com.huawei.systemmanager",
+                    "com.huawei.systemmanager.optimize.process.ProtectActivity"
+                )
+            ),
+            Intent().setComponent(
+                android.content.ComponentName(
+                    "com.coloros.safecenter",
+                    "com.coloros.safecenter.startupapp.StartupAppListActivity"
+                )
+            ),
+            Intent().setComponent(
+                android.content.ComponentName(
+                    "com.coloros.safecenter",
+                    "com.coloros.safecenter.permission.startup.StartupAppListActivity"
+                )
+            ),
+            Intent().setComponent(
+                android.content.ComponentName(
+                    "com.vivo.permissionmanager",
+                    "com.vivo.permissionmanager.activity.BgStartUpManagerActivity"
+                )
+            ),
+            Intent().setComponent(
+                android.content.ComponentName(
+                    "com.samsung.android.lool",
+                    "com.samsung.android.sm.ui.battery.BatteryActivity"
+                )
+            )
         )
-        for (intent in intentList) {
+        for (intent in intents) {
             try {
-                intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 context.startActivity(intent)
-                Toast.makeText(context, "已打开设备专属自启动选项，请授予自启动权限", Toast.LENGTH_SHORT).show()
                 return
-            } catch (e: Exception) {
-                // Try next
+            } catch (t: Throwable) {
+                // 该厂商入口不存在，继续尝试下一个
             }
         }
-        // Fallback to standard app settings Info or standard settings Activity
         try {
-            val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                data = Uri.parse("package:$packageName")
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK
-            }
-            context.startActivity(intent)
-            Toast.makeText(context, "已打开自启动/电池优化设置，请在其中开启自启动", Toast.LENGTH_LONG).show()
-        } catch (e: Exception) {
-            Log.e("MainActivity", "All auto start intents failed", e)
+            context.startActivity(
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + context.packageName))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        } catch (t: Throwable) {
+            Toast.makeText(context, "无法打开自启动管理，请手动在系统设置中允许", Toast.LENGTH_LONG).show()
         }
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+data class AppItem(val name: String, val packageName: String)
+
+private fun loadInstallableApps(context: Context): List<AppItem> {
+    val pm = context.packageManager
+    val apps = try {
+        @Suppress("DEPRECATION")
+        pm.getInstalledApplications(PackageManager.GET_META_DATA)
+    } catch (t: Throwable) {
+        emptyList()
+    }
+    return apps.filter { app ->
+        val isThirdParty = (app.flags and ApplicationInfo.FLAG_SYSTEM) == 0
+        val name = app.packageName.lowercase()
+        isThirdParty ||
+            name.contains("class") || name.contains("school") ||
+            name.contains("brand") || name.contains("board")
+    }.map { app ->
+        val label = try {
+            pm.getApplicationLabel(app).toString()
+        } catch (t: Throwable) {
+            app.packageName
+        }
+        AppItem(label, app.packageName)
+    }.sortedBy { it.name.lowercase() }
+}
+
+private data class Snapshot(
+    val overlay: Boolean,
+    val usage: Boolean,
+    val battery: Boolean,
+    val notification: Boolean,
+    val engineRunning: Boolean,
+    val bubbleRunning: Boolean,
+    val foreground: String,
+    val total: Long,
+    val logs: List<String>
+)
+
 @Composable
-fun MainConfigScreen(
-    modifier: Modifier = Modifier,
-    onOpenOverlaySettings: () -> Unit,
-    onOpenAccessibilitySettings: () -> Unit,
-    onOpenAutoStartSettings: () -> Unit
+private fun HomeScreen(
+    onRequestOverlay: () -> Unit,
+    onRequestUsage: () -> Unit,
+    onRequestBattery: () -> Unit,
+    onRequestNotification: () -> Unit,
+    onRequestAutoStart: () -> Unit,
+    onOpenDetails: () -> Unit
 ) {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    val sharedPrefs = remember { context.getSharedPreferences("class_brand_prefs", Context.MODE_PRIVATE) }
+    val prefs = remember { InterceptConfig.prefs(context) }
 
-    // Read stored config values
-    var targetPackage by remember { mutableStateOf(sharedPrefs.getString("target_package", "test.ndk.com.ndktest2") ?: "test.ndk.com.ndktest2") }
-    var autoStartBoot by remember { mutableStateOf(sharedPrefs.getBoolean("auto_start_on_boot", true)) }
-    var bubbleOpacity by remember { mutableFloatStateOf(sharedPrefs.getFloat("bubble_opacity", 1.0f)) }
-    var hasAutoStarted by remember { mutableStateOf(false) }
-    
-    // Permission dynamic states
-    var isOverlayGranted by remember { mutableStateOf(true) }
-    var isAccessibilityActive by remember { mutableStateOf(MyAccessibilityService.checkAccessibilityPermission(context)) }
-    var isServiceRunningState by remember { mutableStateOf(FloatingWindowService.isServiceRunning) }
+    var snapshot by remember { mutableStateOf(readSnapshot(context)) }
+    var guardEnabled by remember { mutableStateOf(prefs.getBoolean(InterceptConfig.KEY_GUARD_ENABLED, true)) }
+    var mode by remember { mutableStateOf(InterceptConfig.mode(context)) }
+    var bootGuard by remember { mutableStateOf(prefs.getBoolean(InterceptConfig.KEY_BOOT_GUARD_ENABLED, true)) }
+    var bootSeconds by remember { mutableStateOf(InterceptConfig.bootSuppressSeconds(context)) }
+    var autoStart by remember { mutableStateOf(prefs.getBoolean(InterceptConfig.KEY_AUTO_START_ON_BOOT, true)) }
+    var targetPackage by remember { mutableStateOf(InterceptConfig.targetPackage(context)) }
+    var monitorText by remember { mutableStateOf(prefs.getString(InterceptConfig.KEY_MONITOR_PACKAGES, "").orEmpty()) }
+    var iconHidden by remember { mutableStateOf(prefs.getBoolean(InterceptConfig.KEY_ICON_HIDDEN, false)) }
+    var showPicker by remember { mutableStateOf(false) }
+    var installedApps by remember { mutableStateOf<List<AppItem>>(emptyList()) }
 
-    // App List Picker state
-    var showAppPickerDialog by remember { mutableStateOf(false) }
-    var installedAppsList by remember { mutableStateOf<List<AppItem>>(emptyList()) }
-    var isLoadingApps by remember { mutableStateOf(false) }
-
-    // Double-secure lifecycle aware states sync: whenever MainActivity is resumed (brought back),
-    // update all critical status instantly so that permission grants take visual effect immediately!
-    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner) {
-        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
-                isOverlayGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    Settings.canDrawOverlays(context)
-                } else {
-                    true
-                }
-                isAccessibilityActive = MyAccessibilityService.checkAccessibilityPermission(context)
-                isServiceRunningState = FloatingWindowService.isServiceRunning
-                
-                if (!hasAutoStarted && isOverlayGranted && !FloatingWindowService.isServiceRunning) {
-                    hasAutoStarted = true
-                    try {
-                        val intent = Intent(context, FloatingWindowService::class.java)
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            context.startForegroundService(intent)
-                        } else {
-                            context.startService(intent)
-                        }
-                        isServiceRunningState = true
-                    } catch (e: Exception) { }
-                }
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
-        }
-    }
-
-    // Helper to query apps
-    fun fetchApps() {
-        if (installedAppsList.isNotEmpty()) {
-            showAppPickerDialog = true
-            return
-        }
-        isLoadingApps = true
-        showAppPickerDialog = true
-        scope.launch(Dispatchers.IO) {
-            val pm = context.packageManager
-            val apps = pm.getInstalledApplications(PackageManager.GET_META_DATA)
-            val filteredList = apps.filter {
-                // Filter items to show user custom apps mostly
-                (it.flags and ApplicationInfo.FLAG_SYSTEM) == 0 ||
-                it.packageName.contains("class", ignoreCase = true) ||
-                it.packageName.contains("school", ignoreCase = true) ||
-                it.packageName.contains("brand", ignoreCase = true) ||
-                it.packageName.contains("board", ignoreCase = true)
-            }.map {
-                val name = pm.getApplicationLabel(it).toString()
-                AppItem(name, it.packageName)
-            }.sortedBy { it.name }
-
-            withContext(Dispatchers.Main) {
-                installedAppsList = filteredList
-                isLoadingApps = false
-            }
+    LaunchedEffect(Unit) {
+        while (true) {
+            snapshot = readSnapshot(context)
+            delay(1200L)
         }
     }
 
     Column(
-        modifier = modifier
+        modifier = Modifier
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
-                    colors = listOf(
+                    listOf(
                         MaterialTheme.colorScheme.surface,
                         MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)
                     )
@@ -253,506 +322,417 @@ fun MainConfigScreen(
             )
             .padding(20.dp)
     ) {
-        // App Launcher header
         Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 16.dp),
-            shape = RoundedCornerShape(20.dp),
-            elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.Transparent)
         ) {
-            Box(
+            Column(
                 modifier = Modifier
-                    .fillMaxWidth()
                     .background(
                         Brush.horizontalGradient(
-                            colors = listOf(
+                            listOf(
                                 MaterialTheme.colorScheme.primaryContainer,
                                 MaterialTheme.colorScheme.secondaryContainer
                             )
                         )
                     )
-                    .padding(24.dp),
-                contentAlignment = Alignment.Center
+                    .padding(20.dp)
             ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(
-                        text = "班牌悬浮助手控制台",
-                        style = MaterialTheme.typography.headlineSmall.copy(
-                            fontWeight = FontWeight.ExtraBold,
-                            color = MaterialTheme.colorScheme.primary,
-                            letterSpacing = 0.5.sp
-                        )
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "专为各版本安卓定制的极客管理利器",
-                        style = MaterialTheme.typography.bodyMedium.copy(
-                            fontWeight = FontWeight.Medium
-                        ),
-                        color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f),
-                        textAlign = TextAlign.Center
-                    )
-                }
+                Text(
+                    text = "班牌悬浮助手控制台",
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = "开机自启 · 冒头顶回 · 关掉再拉起（全程不用无障碍）",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
 
-        LazyColumn(
-            modifier = Modifier.weight(1f),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            // 1. Permissions status panel
-            item {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
-                    ),
-                    shape = RoundedCornerShape(16.dp)
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        Text(
-                            text = "核心系统权限检测与设置",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 15.sp,
-                            color = MaterialTheme.colorScheme.primary
-                        )
+        Spacer(Modifier.height(16.dp))
 
-                        // Float Window overlay permission
-                        PermissionCheckRow(
-                            label = "显示在其他应用上方 (悬浮窗)",
-                            isGranted = isOverlayGranted,
-                            onGrantClick = {
-                                onOpenOverlaySettings()
-                                Toast.makeText(context, "返回后请手动重新打开此页刷新状态", Toast.LENGTH_SHORT).show()
-                            }
-                        )
-
-                        // Accessibility service active check
-                        PermissionCheckRow(
-                            label = "无障碍服务 (用于快捷结束进程)",
-                            isGranted = isAccessibilityActive,
-                            onGrantClick = onOpenAccessibilitySettings
-                        )
-
-                        // Autostart permission guidance
-                        PermissionCheckRow(
-                            label = "设备专有自启动项 (开机自动加载)",
-                            isGranted = true, // We show self optimization settings
-                            buttonLabel = "去配置",
-                            onGrantClick = onOpenAutoStartSettings
-                        )
-                    }
-                }
-            }
-
-            // 2. Class Brand Target Setup Panel
-            item {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp)
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(14.dp)
-                    ) {
-                        Text(
-                            text = "自定义目标应用设置",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 15.sp,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-
-                        Text(
-                            text = "当点击悬浮窗“强行结束进程”时，默认全力优先寻找并结束下方指定的“电子班牌”包名。如果没有运行，则会自动强退当时打开的下方前台应用。",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-
-                        OutlinedTextField(
-                            value = targetPackage,
-                            onValueChange = {
-                                targetPackage = it
-                                sharedPrefs.edit().putString("target_package", it).apply()
-                            },
-                            label = { Text("电子班牌软件包名 (Package Name)") },
-                            trailingIcon = {
-                                IconButton(onClick = { fetchApps() }) {
-                                    Icon(
-                                        imageVector = Icons.Default.Search,
-                                        contentDescription = "Select App Package Icon"
-                                    )
-                                }
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            shape = RoundedCornerShape(12.dp)
-                        )
-
-                        Button(
-                            onClick = { fetchApps() },
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = MaterialTheme.colorScheme.secondaryContainer,
-                                contentColor = MaterialTheme.colorScheme.onSecondaryContainer
-                            ),
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(10.dp)
-                        ) {
-                            Icon(imageVector = Icons.Default.List, contentDescription = "App List Icon")
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("或从安装的应用列表中选择")
-                        }
-                    }
-                }
-            }
-
-            // 3. Float window Controls Panel
-            item {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp)
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        Text(
-                            text = "悬浮窗与开机启动控管",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 15.sp,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-
-                        // Toggle autostart boot config
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = "开机自启动",
-                                    fontSize = 15.sp,
-                                    fontWeight = FontWeight.Medium
-                                )
-                                Text(
-                                    text = "在设备(电子班牌)开机启动时自动加载悬浮窗",
-                                    fontSize = 12.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                            Switch(
-                                checked = autoStartBoot,
-                                onCheckedChange = {
-                                    autoStartBoot = it
-                                    sharedPrefs.edit().putBoolean("auto_start_on_boot", it).apply()
-                                    Toast.makeText(context, if (it) "已开启开机自启动配置" else "已禁用开机自启动配置", Toast.LENGTH_SHORT).show()
-                                }
-                            )
-                        }
-
-                        Divider(color = MaterialTheme.colorScheme.outlineVariant)
-
-                        // Start / Stop service switch
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = "运行悬浮窗服务",
-                                    fontSize = 15.sp,
-                                    fontWeight = FontWeight.Medium,
-                                    color = if (isServiceRunningState) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
-                                )
-                                Text(
-                                    text = "手动开启、关闭前台常驻悬浮窗",
-                                    fontSize = 12.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                            Switch(
-                                checked = isServiceRunningState,
-                                onCheckedChange = { checked ->
-                                    val intent = Intent(context, FloatingWindowService::class.java)
-                                    if (checked) {
-                                        // Request overlay check before starting
-                                        val hasOverlay = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                                            Settings.canDrawOverlays(context)
-                                        } else {
-                                            true
-                                        }
-
-                                        if (!hasOverlay) {
-                                            Toast.makeText(context, "请先授予上方悬浮屏显示权限！", Toast.LENGTH_LONG).show()
-                                            onOpenOverlaySettings()
-                                        } else {
-                                            try {
-                                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                                    context.startForegroundService(intent)
-                                                } else {
-                                                    context.startService(intent)
-                                                }
-                                                isServiceRunningState = true
-                                                Toast.makeText(context, "悬浮窗已开启", Toast.LENGTH_SHORT).show()
-                                            } catch (e: Exception) {
-                                                Toast.makeText(context, "开启失败: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
-                                            }
-                                        }
-                                    } else {
-                                        context.stopService(intent)
-                                        isServiceRunningState = false
-                                        Toast.makeText(context, "悬浮窗已关闭", Toast.LENGTH_SHORT).show()
-                                    }
-                                }
-                            )
-                        }
-
-                        Divider(color = MaterialTheme.colorScheme.outlineVariant)
-
-                        // Bubble opacity slider
-                        Column(
-                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Text(
-                                text = "悬浮窗默认状态透明度: ${(bubbleOpacity * 100).toInt()}%",
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.Medium
-                            )
-                            Slider(
-                                value = bubbleOpacity,
-                                onValueChange = { 
-                                    bubbleOpacity = it 
-                                    sharedPrefs.edit().putFloat("bubble_opacity", it).apply()
-                                },
-                                valueRange = 0.1f..1.0f
-                            )
-                        }
-                    }
-                }
-            }
-            
-            // 4. Testing Control Panel (Compatible for High Android versions)
-            item {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.8f)
-                    )
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        Text(
-                            text = "兼容测试与手动控制",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 15.sp,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-
-                        Text(
-                            text = "若设备在此Android版本使用悬浮窗受限(例如反复停止)，您可以关闭悬浮窗，并使用下方的按钮进行测试或直接控制，功能与悬浮窗完全相同。",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.8f)
-                        )
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            Button(
-                                onClick = { handleForceKillFromActivity(context, targetPackage) },
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = MaterialTheme.colorScheme.error,
-                                    contentColor = MaterialTheme.colorScheme.onError
-                                ),
-                                shape = RoundedCornerShape(12.dp),
-                                modifier = Modifier.weight(1f).height(48.dp)
-                            ) {
-                                Icon(Icons.Default.Warning, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(Modifier.width(8.dp))
-                                Text("强行结束", fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                            }
-
-                            Button(
-                                onClick = { handleGoHomeFromActivity(context) },
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = MaterialTheme.colorScheme.secondary,
-                                    contentColor = MaterialTheme.colorScheme.onSecondary
-                                ),
-                                shape = RoundedCornerShape(12.dp),
-                                modifier = Modifier.weight(1f).height(48.dp)
-                            ) {
-                                Icon(Icons.Default.Home, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(Modifier.width(8.dp))
-                                Text("返回桌面", fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Quick tip guide
-        Text(
-            text = "配置完成后，您可以放心关闭此主界面，助手将常驻于悬浮窗并在后台持续护航。",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
-            textAlign = TextAlign.Center,
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(vertical = 8.dp)
+                .weight(1f)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            SectionCard(title = "权限清单") {
+                PermissionRow("悬浮窗 / 显示在其他应用上层", snapshot.overlay, onRequestOverlay)
+                Spacer(Modifier.height(8.dp))
+                PermissionRow("使用情况访问（识别前台是不是班牌）", snapshot.usage, onRequestUsage)
+                Spacer(Modifier.height(8.dp))
+                PermissionRow("忽略电池优化（防后台被冻结）", snapshot.battery, onRequestBattery)
+                Spacer(Modifier.height(8.dp))
+                PermissionRow("通知（前台服务常驻凭证）", snapshot.notification, onRequestNotification)
+                Spacer(Modifier.height(8.dp))
+                PermissionRow("厂商自启动白名单（可选，双保险）", false, onRequestAutoStart, buttonLabel = "去设置", grantedLabel = "需手动确认")
+            }
+
+            SectionCard(title = "拦截引擎") {
+                ToggleRow(
+                    label = "总开关",
+                    detail = if (guardEnabled) "发现班牌冒头就处理" else "已停止判定，班牌可正常使用",
+                    checked = guardEnabled
+                ) { value ->
+                    guardEnabled = value
+                    prefs.edit().putBoolean(InterceptConfig.KEY_GUARD_ENABLED, value).apply()
+                    if (value) GuardianService.start(context) else {
+                        CurtainOverlay.hide()
+                        GuardianService.stop(context)
+                    }
+                    EventLog.add(if (value) "拦截已开启" else "拦截已关闭")
+                }
+
+                DividerLine()
+
+                Text(
+                    text = "处理方式",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    ModeChip(
+                        label = "顶回桌面",
+                        selected = mode == InterceptConfig.MODE_BOUNCE,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        mode = InterceptConfig.MODE_BOUNCE
+                        InterceptConfig.setInterceptMode(context, InterceptConfig.MODE_BOUNCE)
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    ModeChip(
+                        label = "幕布遮挡",
+                        selected = mode == InterceptConfig.MODE_CURTAIN,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        mode = InterceptConfig.MODE_CURTAIN
+                        InterceptConfig.setInterceptMode(context, InterceptConfig.MODE_CURTAIN)
+                    }
+                }
+
+                DividerLine()
+
+                ToggleRow(
+                    label = "开机压制",
+                    detail = if (bootGuard) "开机后 " + InterceptConfig.describeSeconds(bootSeconds) + " 内班牌一冒头就顶回去" else "不做开机压制",
+                    checked = bootGuard
+                ) { value ->
+                    bootGuard = value
+                    prefs.edit().putBoolean(InterceptConfig.KEY_BOOT_GUARD_ENABLED, value).apply()
+                }
+
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = "压制时长：" + InterceptConfig.describeSeconds(bootSeconds),
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Slider(
+                    value = bootSeconds.toFloat(),
+                    onValueChange = { bootSeconds = it.toInt() },
+                    onValueChangeFinished = {
+                        InterceptConfig.setBootSuppressSeconds(context, bootSeconds)
+                    },
+                    valueRange = 15f..600f,
+                    enabled = bootGuard
+                )
+
+                DividerLine()
+
+                Text(
+                    text = "目标班牌包名",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = targetPackage,
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Spacer(Modifier.height(8.dp))
+                Row {
+                    Button(
+                        onClick = {
+                            installedApps = loadInstallableApps(context)
+                            showPicker = true
+                        },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                    ) {
+                        Text("从已安装应用选择", fontSize = 12.sp)
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Button(
+                        onClick = { onOpenDetails() },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+                    ) {
+                        Text("打开本应用详情", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSecondaryContainer)
+                    }
+                }
+
+                Spacer(Modifier.height(10.dp))
+                OutlinedTextField(
+                    value = monitorText,
+                    onValueChange = {
+                        monitorText = it
+                        prefs.edit().putString(InterceptConfig.KEY_MONITOR_PACKAGES, it).apply()
+                    },
+                    label = { Text("额外的监控包名（逗号分隔，可留空）", fontSize = 11.sp) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    textStyle = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            SectionCard(title = "开机启动（无无障碍）") {
+                ToggleRow(
+                    label = "开机自启悬浮控制台",
+                    detail = if (autoStart) "开机后自动拉起气泡与守护引擎" else "开机后不自动启动",
+                    checked = autoStart
+                ) { value ->
+                    autoStart = value
+                    prefs.edit().putBoolean(InterceptConfig.KEY_AUTO_START_ON_BOOT, value).apply()
+                }
+                DividerLine()
+                Text(
+                    text = "说明：安卓 10 起后台启动需要「前台服务 + 开机广播」，本应用已按此实现；" +
+                        "首次安装后请先手动打开一次本应用，否则部分机型会拦截开机广播。",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            SectionCard(title = "运行状态") {
+                StatusRow("守护引擎", if (snapshot.engineRunning) "运行中" else "已停止", snapshot.engineRunning)
+                StatusRow("悬浮窗服务", if (snapshot.bubbleRunning) "运行中" else "已停止", snapshot.bubbleRunning)
+                StatusRow("当前前台应用", snapshot.foreground, snapshot.foreground == targetPackage)
+                StatusRow("累计拦截次数", snapshot.total.toString(), true)
+
+                DividerLine()
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    Button(
+                        onClick = {
+                            AppActions.goHome(context)
+                            AppActions.killBackground(context, targetPackage)
+                            InterceptConfig.addIntercept(context)
+                            EventLog.add("手动：已把班牌顶回桌面")
+                            Toast.makeText(context, "已归位", Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                    ) {
+                        Text("立即归位", fontSize = 12.sp)
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Button(
+                        onClick = {
+                            if (CurtainOverlay.isShowing) CurtainOverlay.hide()
+                            else CurtainOverlay.show(context, "班牌已暂停使用", "手动幕布遮挡")
+                        },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+                    ) {
+                        Text(if (CurtainOverlay.isShowing) "撤掉幕布" else "盖上幕布", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSecondaryContainer)
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    Button(
+                        onClick = {
+                            GuardianService.start(context)
+                            WatchdogScheduler.ensureArmed(context)
+                            Toast.makeText(context, "已重启守护引擎", Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                    ) {
+                        Text("重启引擎", fontSize = 12.sp)
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Button(
+                        onClick = {
+                            iconHidden = false
+                            prefs.edit().putBoolean(InterceptConfig.KEY_ICON_HIDDEN, false).apply()
+                            FloatingWindowService.start(context)
+                            Toast.makeText(context, "气泡已恢复", Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+                    ) {
+                        Text(if (iconHidden) "恢复气泡" else "重挂气泡", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSecondaryContainer)
+                    }
+                }
+            }
+
+            SectionCard(title = "最近事件") {
+                if (snapshot.logs.isEmpty()) {
+                    Text(
+                        text = "暂无记录",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    snapshot.logs.forEach { line ->
+                        Text(
+                            text = line,
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(vertical = 2.dp)
+                        )
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+                TextButton(onClick = {
+                    EventLog.clear()
+                    snapshot = readSnapshot(context)
+                }) {
+                    Text("清空记录", fontSize = 11.sp)
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+        }
+
+        Text(
+            text = "提示：幕布遮挡后长按屏幕 5 秒即可解除；所有设置即时生效，无需重启应用。",
+            fontSize = 11.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 12.dp)
         )
     }
 
-    // App Picker Dialog structure
-    if (showAppPickerDialog) {
-        Dialog(onDismissRequest = { showAppPickerDialog = false }) {
-            Surface(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(450.dp),
-                shape = RoundedCornerShape(20.dp),
-                color = MaterialTheme.colorScheme.surface,
-                tonalElevation = 6.dp
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp)
+    if (showPicker) {
+        AlertDialog(
+            onDismissRequest = { showPicker = false },
+            title = { Text("选择目标应用", fontSize = 16.sp, fontWeight = FontWeight.Bold) },
+            text = {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = MaterialTheme.colorScheme.surface,
+                    modifier = Modifier.fillMaxWidth().height(450.dp)
                 ) {
-                    Text(
-                        text = "选择您的班牌应用",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(bottom = 12.dp)
-                    )
-
-                    if (isLoadingApps) {
-                        Box(
-                            modifier = Modifier
-                                .weight(1f)
-                                .fillMaxWidth(),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            CircularProgressIndicator()
-                        }
-                    } else {
-                        LazyColumn(
-                            modifier = Modifier.weight(1f),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            items(installedAppsList) { app ->
-                                Card(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clickable {
-                                            targetPackage = app.packageName
-                                            sharedPrefs
-                                                .edit()
-                                                .putString("target_package", app.packageName)
-                                                .apply()
-                                            showAppPickerDialog = false
-                                            Toast
-                                                .makeText(
-                                                    context,
-                                                    "目标已设定为：「${app.name}」",
-                                                    Toast.LENGTH_SHORT
-                                                )
-                                                .show()
-                                        },
-                                    colors = CardDefaults.cardColors(
-                                        containerColor = if (targetPackage == app.packageName) {
-                                            MaterialTheme.colorScheme.primaryContainer
-                                        } else {
-                                            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
-                                        }
-                                    )
-                                ) {
-                                    Column(modifier = Modifier.padding(12.dp)) {
-                                        Text(
-                                            text = app.name,
-                                            fontWeight = FontWeight.Bold,
-                                            fontSize = 14.sp
-                                        )
-                                        Text(
-                                            text = app.packageName,
-                                            fontSize = 11.sp,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
+                    LazyColumn {
+                        items(installedApps.size) { index ->
+                            val item = installedApps[index]
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        targetPackage = item.packageName
+                                        InterceptConfig.setTargetPackage(context, item.packageName)
+                                        showPicker = false
+                                        EventLog.add("目标已切换：" + item.packageName)
                                     }
-                                }
+                                    .padding(horizontal = 12.dp, vertical = 10.dp)
+                            ) {
+                                Text(
+                                    text = item.name,
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Text(
+                                    text = item.packageName,
+                                    fontSize = 11.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                             }
                         }
                     }
-
-                    Spacer(modifier = Modifier.height(12.dp))
-
-                    TextButton(
-                        onClick = { showAppPickerDialog = false },
-                        modifier = Modifier.align(Alignment.End)
-                    ) {
-                        Text("取消")
-                    }
                 }
+            },
+            confirmButton = {
+                TextButton(onClick = { showPicker = false }) { Text("取消") }
             }
-        }
+        )
     }
 }
 
-fun handleForceKillFromActivity(context: Context, targetPackage: String) {
-    val asRunning = MyAccessibilityService.checkAccessibilityPermission(context)
-    if (!asRunning) {
-        Toast.makeText(context, "检测到无障碍不可用。\n正在跳转应用详情页，请手动点击【强行停止】", Toast.LENGTH_LONG).show()
-        try {
-            val intent = Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                data = android.net.Uri.parse("package:$targetPackage")
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK
-            }
-            context.startActivity(intent)
-        } catch (e: Exception) {
-            Toast.makeText(context, "无法打开应用详情", Toast.LENGTH_SHORT).show()
-        }
-        return
+private fun readSnapshot(context: Context): Snapshot {
+    val notificationEnabled = try {
+        NotificationManagerCompat.from(context).areNotificationsEnabled()
+    } catch (t: Throwable) {
+        false
     }
-
-    val onHome = MyAccessibilityService.isCurrentlyOnLauncher
-    if (onHome) {
-        Toast.makeText(context, "当前已经处于桌面状态", Toast.LENGTH_SHORT).show()
+    val batteryOk = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        (context.getSystemService(Context.POWER_SERVICE) as? PowerManager)
+            ?.isIgnoringBatteryOptimizations(context.packageName) ?: false
+    } else {
+        true
     }
-
-    MyAccessibilityService.startForceStopSequence(context, targetPackage)
-    Toast.makeText(context, "已触发结束应用流程...", Toast.LENGTH_SHORT).show()
+    val overlay = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) Settings.canDrawOverlays(context) else true
+    return Snapshot(
+        overlay = overlay,
+        usage = ForegroundWatcher.hasUsageAccess(context),
+        battery = batteryOk,
+        notification = notificationEnabled,
+        engineRunning = GuardianService.isRunning,
+        bubbleRunning = FloatingWindowService.isServiceRunning,
+        foreground = GuardianService.lastSeenPackage ?: "未知",
+        total = InterceptConfig.totalIntercepts(context),
+        logs = EventLog.snapshot()
+    )
 }
 
-fun handleGoHomeFromActivity(context: Context) {
-    try {
-        val intent = Intent(Intent.ACTION_MAIN).apply {
-            addCategory(Intent.CATEGORY_HOME)
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+@Composable
+private fun SectionCard(title: String, content: @Composable () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+        )
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                text = title,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.primary
+            )
+            Spacer(Modifier.height(10.dp))
+            DividerLine()
+            Spacer(Modifier.height(10.dp))
+            content()
         }
-        context.startActivity(intent)
-        Toast.makeText(context, "已返回主屏幕", Toast.LENGTH_SHORT).show()
-    } catch (e: Exception) {
-        Toast.makeText(context, "返回桌面失败", Toast.LENGTH_SHORT).show()
     }
 }
 
 @Composable
-fun PermissionCheckRow(
+private fun DividerLine() {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(1.dp)
+            .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+    )
+}
+
+@Composable
+private fun PermissionRow(
     label: String,
     isGranted: Boolean,
+    onGrantClick: () -> Unit,
     buttonLabel: String = "去授权",
-    onGrantClick: () -> Unit
+    grantedLabel: String = "已启用"
 ) {
     Row(
         modifier = Modifier
@@ -760,8 +740,7 @@ fun PermissionCheckRow(
             .clip(RoundedCornerShape(10.dp))
             .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.5f))
             .padding(horizontal = 12.dp, vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
+        verticalAlignment = Alignment.CenterVertically
     ) {
         Column(modifier = Modifier.weight(1f)) {
             Text(
@@ -771,36 +750,90 @@ fun PermissionCheckRow(
                 color = MaterialTheme.colorScheme.onSurface
             )
             Text(
-                text = if (isGranted) "已启用" else "未启用",
+                text = if (isGranted) grantedLabel else "未启用",
                 fontSize = 11.sp,
-                color = if (isGranted) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
-                fontWeight = FontWeight.SemiBold
+                fontWeight = FontWeight.SemiBold,
+                color = if (isGranted) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
             )
         }
-        
         Button(
             onClick = onGrantClick,
-            colors = ButtonDefaults.buttonColors(
-                containerColor = if (isGranted) {
-                    MaterialTheme.colorScheme.secondaryContainer
-                } else {
-                    MaterialTheme.colorScheme.primary
-                },
-                contentColor = if (isGranted) {
-                    MaterialTheme.colorScheme.onSecondaryContainer
-                } else {
-                    MaterialTheme.colorScheme.onPrimary
-                }
-            ),
-            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 2.dp),
             modifier = Modifier.height(32.dp),
-            shape = RoundedCornerShape(8.dp)
+            shape = RoundedCornerShape(8.dp),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 2.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (isGranted) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.primary
+            )
         ) {
+            Text(buttonLabel, fontSize = 11.sp)
+        }
+    }
+}
+
+@Composable
+private fun ToggleRow(label: String, detail: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = if (isGranted) "已设置" else buttonLabel,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Medium
+                text = label,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            Text(
+                text = detail,
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
+        Switch(checked = checked, onCheckedChange = onCheckedChange)
+    }
+}
+
+@Composable
+private fun StatusRow(label: String, value: String, highlight: Boolean) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = label,
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.weight(1f)
+        )
+        Text(
+            text = value,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = if (highlight) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+        )
+    }
+}
+
+@Composable
+private fun ModeChip(label: String, selected: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    Box(
+        modifier = modifier
+            .height(38.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(
+                if (selected) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.surface.copy(alpha = 0.6f)
+            )
+            .clickable { onClick() },
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = label,
+            fontSize = 12.sp,
+            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+            color = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }

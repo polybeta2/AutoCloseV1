@@ -3,40 +3,40 @@ package com.example
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.os.Build
-import android.util.Log
 
+/**
+ * 开机与覆盖安装的唯一入口。
+ *
+ * 普通应用没法定向拦截别人的开机广播，所以这里的策略是"抢跑"：
+ * 开机后立刻拉起守护引擎并开一个【开机压制窗口】，
+ * 窗口内班牌只要冒头就被顶回桌面（或盖上幕布），效果等同于"拦截了它的开机自启"。
+ */
 class BootCompletedReceiver : BroadcastReceiver() {
 
-    companion object {
-        private const val TAG = "BootCompletedReceiver"
-    }
+    override fun onReceive(context: Context, intent: Intent?) {
+        val action = intent?.action ?: return
+        val prefs = InterceptConfig.prefs(context)
+        EventLog.add("系统广播：" + action)
 
-    override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action == Intent.ACTION_BOOT_COMPLETED || 
-            intent.action == Intent.ACTION_LOCKED_BOOT_COMPLETED ||
-            intent.action == Intent.ACTION_USER_PRESENT ||
-            intent.action == "android.intent.action.QUICKBOOT_POWERON") {
-            Log.d(TAG, "Device booted or user present! Action received: ${intent.action}")
-            
-            val sharedPrefs = context.getSharedPreferences("class_brand_prefs", Context.MODE_PRIVATE)
-            val isAutoStartEnabled = sharedPrefs.getBoolean("auto_start_on_boot", true)
-            
-            if (isAutoStartEnabled && !FloatingWindowService.isServiceRunning) {
-                try {
-                    val serviceIntent = Intent(context, FloatingWindowService::class.java)
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        context.startForegroundService(serviceIntent)
-                    } else {
-                        context.startService(serviceIntent)
-                    }
-                    Log.d(TAG, "FloatingWindowService started successfully on boot/user_present.")
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to auto-start FloatingWindowService", e)
-                }
-            } else {
-                Log.d(TAG, "Auto-start is disabled or service already running.")
-            }
+        if (action == Intent.ACTION_MY_PACKAGE_REPLACED) {
+            EventLog.add("已覆盖安装，重新武装看门狗")
+            WatchdogScheduler.ensureArmed(context)
         }
+
+        val guardEnabled = prefs.getBoolean(InterceptConfig.KEY_GUARD_ENABLED, true)
+        val bootGuardEnabled = prefs.getBoolean(InterceptConfig.KEY_BOOT_GUARD_ENABLED, true)
+        val suppressSeconds = if (guardEnabled && bootGuardEnabled) {
+            InterceptConfig.bootSuppressSeconds(context)
+        } else {
+            0
+        }
+
+        if (guardEnabled) {
+            GuardianService.start(context, suppressSeconds)
+        }
+        if (prefs.getBoolean(InterceptConfig.KEY_AUTO_START_ON_BOOT, true)) {
+            FloatingWindowService.start(context)
+        }
+        WatchdogScheduler.ensureArmed(context)
     }
 }

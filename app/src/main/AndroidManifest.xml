@@ -2,11 +2,26 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Permissions required for overlay, boot completions and foreground service execution -->
+    <!-- 悬浮气泡 / 幕布 -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- 开机自启（不用无障碍，只靠 BOOT_COMPLETED + 前台服务） -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- 两个常驻前台服务 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 识别当前前台应用（需用户在设置里手动授予，属特殊权限） -->
+    <uses-permission
+        android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
+    <!-- 让系统回收目标应用的后台进程 -->
+    <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+    <!-- 申请电池优化白名单，防止服务被冻结 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- 选择目标应用时需要枚举已安装应用 -->
+    <uses-permission
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
 
     <application
         android:allowBackup="true"
@@ -31,7 +46,18 @@
             </intent-filter>
         </activity>
 
-        <!-- The Floating Window display Service -->
+        <!-- 判定循环：使用情况统计 + 归位 / 幕布 -->
+        <service
+            android:name=".GuardianService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Class brand Guardian: keeps a low-frequency foreground check that sends the phone back to home screen (or draws a curtain) when a school panel app comes to the foreground." />
+        </service>
+
+        <!-- 悬浮气泡控制台 -->
         <service
             android:name=".FloatingWindowService"
             android:enabled="true"
@@ -42,32 +68,25 @@
                 android:value="Floating control overlay for panel system app interruption helper widget." />
         </service>
 
-        <!-- Automate clicks and detect background packages -->
-        <service
-            android:name=".MyAccessibilityService"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.accessibilityservice.AccessibilityService" />
-            </intent-filter>
-            <meta-data
-                android:name="android.accessibilityservice"
-                android:resource="@xml/accessibility_service_config" />
-        </service>
-
-        <!-- Boot Completed receiver for Autostart -->
+        <!-- 开机 / 覆盖安装：拉起服务并开启"开机压制窗口" -->
         <receiver
             android:name=".BootCompletedReceiver"
             android:enabled="true"
             android:exported="true">
             <intent-filter android:priority="999">
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
-                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
-                <action android:name="android.intent.action.USER_PRESENT" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.USER_PRESENT" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </receiver>
+
+        <!-- 看门狗心跳：每 5 分钟自检一次，服务被划掉后自动拉起 -->
+        <receiver
+            android:name=".WatchdogReceiver"
+            android:enabled="true"
+            android:exported="false" />
 
     </application>
 

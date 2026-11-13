@@ -1,21 +1,98 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# 班牌悬浮助手（AutoCloseV1）
 
-# Run and deploy your AI Studio app
+学校电子班牌/教室大屏的**本地管控小工具**。不需要 root，不需要无障碍服务，也不需要改班牌本身：
 
-This contains everything you need to run your app locally.
+- **开机自启**：安卓标准的 `BOOT_COMPLETED` + 前台服务，全程无无障碍。
+- **冒头顶回去**：班牌一回到前台，就把设备切回桌面（或盖一层"幕布"）。
+- **关掉再拉起**：`AlarmManager` 五分钟心跳 + 前台服务互相看护，被划掉后自动复活。
+- **开机压制窗口**：开机后一段时间内持续执行上面的动作，等效"拦掉了班牌的开机自启"。
 
-View your app in AI Studio: https://ai.studio/apps/69459a3a-c975-4d69-a03a-47c058d1606c
+> 定位：**校方运维侧的应急/演示工具**。它只影响本机的前台切换，不修改、不注入、不抓取班牌应用的数据。
 
-## Run Locally
+---
 
-**Prerequisites:**  [Android Studio](https://developer.android.com/studio)
+## 一、四条能力线
 
+| 能力 | 实现要点 | 说明 |
+| --- | --- | --- |
+| 开机自启 | `RECEIVE_BOOT_COMPLETED` + `BootCompletedReceiver` | 收到开机广播后直接 `startForegroundService`，不依赖无障碍 |
+| 冒头判定 | `UsageStatsManager`（使用情况访问权限） | 每 800ms 采一次前台包名，命中目标包名即触发 |
+| 顶回桌面 | `Intent.ACTION_MAIN` + `CATEGORY_HOME` | 纯标准 API，任何机型都可用 |
+| 幕布遮挡 | `TYPE_APPLICATION_OVERLAY` 全屏悬浮层 | 代替"归位"的温和方案：班牌还在跑，但屏幕被盖住、触摸被吞 |
+| 关掉再拉起 | `AlarmManager.setInexactRepeating`（5 分钟） | 心跳广播里检查两个服务是否存活，不在就重启 |
+| 开机压制 | `suppress_until` 时间戳 | 开机后 N 秒内一直执行压制逻辑，覆盖班牌自启的那段时间 |
 
-1. Open Android Studio
-2. Select **Open** and choose the directory containing this project
-3. Allow Android Studio to fix any incompatibilities as it imports the project.
-4. Create a file named `.env` in the project directory and set `GEMINI_API_KEY` in that file to your Gemini API key (see `.env.example` for an example)
-5. Remove this line from the app's `build.gradle.kts` file: `signingConfig = signingConfigs.getByName("debugConfig")`
-6. Run the app on an emulator or physical device
+---
+
+## 二、首次使用（三步）
+
+1. 安装 APK，打开应用。
+2. 按界面里的**权限清单**逐项授权：
+   - 悬浮窗（显示在其他应用上层）—— 必须
+   - 使用情况访问 —— 必须（用于识别前台是不是班牌）
+   - 忽略电池优化 —— 强烈建议（否则国产 ROM 会在熄屏后冻结服务）
+   - 通知 —— 建议（前台服务的常驻通知）
+   - 厂商自启动白名单 —— 可选，双保险
+3. 在「目标班牌包名」里点**从已安装应用选择**，选中学校的班牌 APK（默认值 `test.ndk.com.ndktest2` 只是开发时的占位）。
+
+之后直接按息屏键/重启设备即可验证：班牌冒头会被顶回桌面。
+
+---
+
+## 三、界面说明
+
+- **控制台卡片**：权限状态、拦截总开关、处理方式（顶回桌面 / 幕布遮挡）、开机压制时长（15s~600s）、目标包名、附加监控包名。
+- **运行状态**：两个服务是否在跑、当前前台包名、累计拦截次数、最近 40 条事件。
+- **悬浮气泡**：金色圆点，可拖动；点一下展开面板，可一键归位、盖上/撤掉幕布、临时关拦截、调气泡透明度、隐藏气泡。
+- **幕布解锁**：幕布是全屏不透明层，**长按屏幕 5 秒**即可解除（同时自动关闭拦截开关，避免把自己锁在外面）。
+
+---
+
+## 四、实现说明与边界（重要）
+
+普通第三方应用在安卓上的能力是有硬边界的，本项目**没有**绕过这些边界：
+
+1. **无法阻止班牌收到开机广播**。所以"拦截开机自启"的真实实现是：自己也开机自启，然后在开机后的压制窗口里，把每次冒头的班牌顶回去。
+2. **无法 `am force-stop` 别的应用**（那是系统/root 权限）。本项目只用 `killBackgroundProcesses`，系统有权立刻把它再拉起来——所以需要"余温冷却 + 看门狗"来打持久战。
+3. **必须有「使用情况访问」权限**才能精确判断前台应用。没有该权限时，只在开机压制窗口内做低频兜底归位（会误伤其它应用，属降级模式）。
+4. **国产 ROM 的自启动管理**会拦截 `BOOT_COMPLETED`。装完先手动打开一次应用，并在系统设置里把它加入自启动白名单。
+5. 幕布模式对"分屏/画中画"的覆盖不完整，遇到异常可长按 5 秒解除。
+
+---
+
+## 五、构建
+
+本地构建（可选）：
+
+```bash
+./gradlew :app:assembleDebug
+```
+
+推荐直接用 GitHub Actions：推送到 `main` 或手动触发 `Android CI` workflow，产物在 Actions 的 Artifacts 里（`app-debug.apk`）。打 tag（`v*`）会自动创建 Release 并附上 APK。
+
+- JDK 21、AGP 9.x、compileSdk 36、minSdk 24
+- debug 签名用仓库里的 `debug.keystore.base64` 在 CI 里解码生成，不需要额外配置
+
+---
+
+## 六、目录结构
+
+```
+app/src/main/java/com/example/
+├── MainActivity.kt          控制台界面（Compose）
+├── InterceptConfig.kt       配置项与纯逻辑（可单测）
+├── GuardianService.kt       判定循环：找前台 → 归位/幕布 → 计次
+├── FloatingWindowService.kt 悬浮气泡与快捷面板
+├── CurtainOverlay.kt        全屏幕布（长按 5 秒解除）
+├── BootCompletedReceiver.kt 开机 / 覆盖安装入口
+├── WatchdogScheduler.kt     5 分钟心跳 + WatchdogReceiver
+├── ForegroundWatcher.kt     使用情况统计封装
+├── AppActions.kt            归位 / 回收后台进程 / 打开应用详情
+└── EventLog.kt              40 条环形运行日志
+```
+
+---
+
+## 七、免责声明
+
+仅用于自己管理的设备（学校教室班牌、演示机）。请勿用于他人设备。作者不对因使用本工具导致的设备异常、教学事故或违反校规承担责任。
