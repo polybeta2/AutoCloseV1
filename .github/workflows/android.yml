@@ -24,13 +24,22 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install platform 36
+      - name: Locate Android SDK
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" > /dev/null
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "SDK root: $SDK_ROOT"
+          ls "$SDK_ROOT" || true
+          SDKMGR=$(find "$SDK_ROOT/cmdline-tools" -maxdepth 4 -name sdkmanager -type f 2>/dev/null | head -n1)
+          echo "sdkmanager: $SDKMGR"
+          echo "SDKMANAGER=$SDKMGR" >> "$GITHUB_ENV"
+
+      - name: Accept licenses and install platform 36
+        run: |
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-36" || echo "::warning::platforms;android-36 install failed, letting AGP try"
+          ls "$ANDROID_SDK_ROOT/platforms" || true
 
       - name: Restore debug keystore
         run: base64 -d debug.keystore.base64 > debug.keystore
